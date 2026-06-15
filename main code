@@ -1,0 +1,379 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <ESP32Servo.h>
+#include <Adafruit_INA219.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ================= WIFI =================
+const char* ssid = "...";
+const char* password = "...";
+
+WebServer server(80);
+
+// ================= OLED =================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  -1
+);
+
+// ================= INA219 =================
+Adafruit_INA219 ina219;
+
+// ================= SERVO =================
+Servo trackerServo;
+
+// ================= PIN =================
+const int ldrLeftPin  = 34;
+const int ldrRightPin = 35;
+const int servoPin    = 18;
+
+// ================= TRACKER =================
+int servoPos = 90;
+
+const int SERVO_MIN = 0;
+const int SERVO_MAX = 180;
+
+const int deadBand = 150;
+
+unsigned long lastMove = 0;
+const unsigned long moveInterval = 100;
+
+// ================= WEB DATA =================
+int gLeft = 0;
+int gRight = 0;
+int gServo = 0;
+
+float gVoltage = 0;
+float gCurrent = 0;
+float gPower = 0;
+
+// =====================================================
+// WEB PAGE
+// =====================================================
+void handleRoot()
+{
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<title>Solar Tracker ESP32</title>
+
+<style>
+
+body{
+  margin:0;
+  padding:20px;
+  background:#0f172a;
+  font-family:Arial,sans-serif;
+  color:white;
+  text-align:center;
+}
+
+h1{
+  color:#38bdf8;
+}
+
+.container{
+  display:flex;
+  flex-wrap:wrap;
+  justify-content:center;
+}
+
+.card{
+  width:220px;
+  margin:10px;
+  padding:20px;
+  border-radius:15px;
+  background:#1e293b;
+  box-shadow:0 0 15px rgba(0,0,0,0.3);
+}
+
+.label{
+  color:#94a3b8;
+  font-size:18px;
+}
+
+.value{
+  margin-top:10px;
+  font-size:32px;
+  color:#22c55e;
+  font-weight:bold;
+}
+
+</style>
+
+<script>
+
+function updateData()
+{
+  fetch('/data')
+  .then(response => response.json())
+  .then(data => {
+
+    document.getElementById('left').innerHTML =
+      data.left;
+
+    document.getElementById('right').innerHTML =
+      data.right;
+
+    document.getElementById('servo').innerHTML =
+      data.servo + "°";
+
+    document.getElementById('volt').innerHTML =
+      data.voltage + " V";
+
+    document.getElementById('curr').innerHTML =
+      data.current + " mA";
+
+    document.getElementById('power').innerHTML =
+      data.power + " W";
+
+  });
+}
+
+setInterval(updateData,1000);
+
+</script>
+
+</head>
+
+<body onload="updateData()">
+
+<h1>☀️ SOLAR TRACKER ESP32</h1>
+
+<div class="container">
+
+<div class="card">
+<div class="label">LDR Kiri</div>
+<div class="value" id="left">0</div>
+</div>
+
+<div class="card">
+<div class="label">LDR Kanan</div>
+<div class="value" id="right">0</div>
+</div>
+
+<div class="card">
+<div class="label">Servo</div>
+<div class="value" id="servo">0°</div>
+</div>
+
+<div class="card">
+<div class="label">Tegangan</div>
+<div class="value" id="volt">0</div>
+</div>
+
+<div class="card">
+<div class="label">Arus</div>
+<div class="value" id="curr">0</div>
+</div>
+
+<div class="card">
+<div class="label">Daya</div>
+<div class="value" id="power">0</div>
+</div>
+
+</div>
+
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+// =====================================================
+// JSON DATA
+// =====================================================
+void handleData()
+{
+  String json = "{";
+
+  json += "\"left\":" + String(gLeft) + ",";
+  json += "\"right\":" + String(gRight) + ",";
+  json += "\"servo\":" + String(gServo) + ",";
+  json += "\"voltage\":" + String(gVoltage,2) + ",";
+  json += "\"current\":" + String(gCurrent,1) + ",";
+  json += "\"power\":" + String(gPower,3);
+
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+// =====================================================
+// LDR AVERAGE
+// =====================================================
+int readLDR(int pin)
+{
+  long total = 0;
+
+  for(int i=0;i<10;i++)
+  {
+    total += analogRead(pin);
+    delay(2);
+  }
+
+  return total / 10;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup()
+{
+  Serial.begin(115200);
+
+  analogReadResolution(12);
+
+  Wire.begin(21,22);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC,0x3C))
+  {
+    Serial.println("OLED gagal");
+    while(1);
+  }
+
+  if(!ina219.begin())
+  {
+    Serial.println("INA219 tidak ditemukan");
+  }
+
+  trackerServo.setPeriodHertz(50);
+  trackerServo.attach(servoPin,500,2500);
+  trackerServo.write(servoPos);
+
+  WiFi.begin(ssid,password);
+
+  Serial.print("Connecting");
+
+  int timeout = 0;
+  while(WiFi.status()!=WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+    timeout++;
+    
+    if(timeout > 30)
+    {
+      Serial.println("\nGagal konek! Coba lagi...");
+      WiFi.disconnect(true,true);
+      delay(1000);
+      WiFi.begin(ssid,password);
+      timeout = 0;
+    }
+  }
+
+  Serial.println();
+  Serial.println("WiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("Coba buka: http://");
+  Serial.println(WiFi.localIP());
+  Serial.println(" di browser!");
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+
+  server.begin();
+
+  Serial.println("Web Server Started!");
+
+  display.clearDisplay();
+  display.display();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop()
+{
+  server.handleClient();
+
+  int leftValue = readLDR(ldrLeftPin);
+  int rightValue = readLDR(ldrRightPin);
+
+  int diff = leftValue - rightValue;
+
+  if(millis() - lastMove >= moveInterval)
+  {
+    int step = map(abs(diff),0,4095,1,5);
+
+    if(diff > deadBand)
+    {
+        servoPos += step;
+    }
+    else if(diff < -deadBand)
+    {
+        servoPos -= step;
+    }
+
+    servoPos = constrain(
+      servoPos,
+      SERVO_MIN,
+      SERVO_MAX
+    );
+
+    trackerServo.write(servoPos);
+
+    lastMove = millis();
+  }
+
+  float voltage = ina219.getBusVoltage_V();
+  float current = ina219.getCurrent_mA();
+  float power = voltage * current / 1000.0;
+
+  gLeft = leftValue;
+  gRight = rightValue;
+  gServo = servoPos;
+
+  gVoltage = voltage;
+  gCurrent = current;
+  gPower = power;
+
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  display.setCursor(0,0);
+  display.println("SOLAR TRACKER");
+
+  display.setCursor(0,12);
+  display.print("LDR L: ");
+  display.println(leftValue);
+
+  display.setCursor(0,22);
+  display.print("LDR R: ");
+  display.println(rightValue);
+
+  display.setCursor(0,32);
+  display.print("Servo: ");
+  display.println(servoPos);
+
+  display.setCursor(0,42);
+  display.print("V:");
+  display.print(voltage,2);
+
+  display.setCursor(70,42);
+  display.print("I:");
+  display.print(current,0);
+
+  display.setCursor(0,54);
+  display.print("P:");
+  display.print(power,3);
+
+  display.display();
+
+  delay(20);
+}
